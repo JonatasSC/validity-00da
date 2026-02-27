@@ -48,13 +48,63 @@ class USBDevice:
         log.info("Device opened and interface claimed")
         return True
 
+    def reset(self):
+        """USB reset the device. Re-finds it since reset changes the address."""
+        assert self.dev is not None, "Device not opened"
+        log.info("Resetting USB device")
+        try:
+            self.dev.reset()
+        except usb.core.USBError:
+            pass  # Reset often causes a transient error
+
+        # Device gets a new address after reset — must re-find it
+        import time
+        usb.util.dispose_resources(self.dev)
+        self.dev = None
+        time.sleep(1.5)
+
+        self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+        if self.dev is None:
+            raise RuntimeError("Device not found after USB reset")
+
+        if self.dev.is_kernel_driver_active(0):
+            self.dev.detach_kernel_driver(0)
+
+        self.dev.set_configuration()
+        usb.util.claim_interface(self.dev, 0)
+        log.info("Device reset complete (bus %d addr %d)", self.dev.bus, self.dev.address)
+
     def close(self):
         """Release the USB device."""
         if self.dev is not None:
-            usb.util.release_interface(self.dev, 0)
-            usb.util.dispose_resources(self.dev)
+            try:
+                usb.util.release_interface(self.dev, 0)
+            except usb.core.USBError:
+                pass
+            try:
+                usb.util.dispose_resources(self.dev)
+            except usb.core.USBError:
+                pass
             self.dev = None
             log.info("Device closed")
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if device handle is still valid."""
+        if self.dev is None:
+            return False
+        try:
+            self.dev.get_active_configuration()
+            return True
+        except (usb.core.USBError, usb.core.NoBackendError):
+            return False
+
+    def reopen(self) -> bool:
+        """Close and re-open the device (e.g. after it disconnected)."""
+        self.close()
+        import time
+        time.sleep(2)
+        return self.open()
 
     def write(self, data: bytes, timeout: int = USB_TIMEOUT) -> int:
         """Send data via bulk OUT endpoint. Returns bytes written."""
@@ -63,16 +113,25 @@ class USBDevice:
         written = self.dev.write(EP_OUT, data, timeout=timeout)
         return written
 
-    def read(self, size: int = 0x100000, timeout: int = USB_TIMEOUT) -> bytes:
-        """Read data from bulk IN endpoint."""
+    def read(self, size: int = 0x100000, timeout: int = USB_TIMEOUT) -> Optional[bytes]:
+        """Read data from bulk IN endpoint. Returns None on timeout."""
         assert self.dev is not None, "Device not opened"
-        data = self.dev.read(EP_IN, size, timeout=timeout)
-        result = bytes(data)
-        log.debug("USB READ (%d bytes): %s", len(result), result.hex())
-        return result
+        try:
+            data = self.dev.read(EP_IN, size, timeout=timeout)
+            result = bytes(data)
+            log.debug("USB READ (%d bytes): %s", len(result), result.hex())
+            return result
+        except usb.core.USBTimeoutError:
+            log.debug("USB READ timeout")
+            return None
+        except usb.core.USBError as e:
+            if "timed out" in str(e).lower():
+                log.debug("USB READ timeout")
+                return None
+            raise
 
-    def cmd(self, data: bytes, timeout: int = USB_TIMEOUT) -> bytes:
-        """Send command and read response."""
+    def cmd(self, data: bytes, timeout: int = USB_TIMEOUT) -> Optional[bytes]:
+        """Send command and read response. Returns None on timeout."""
         self.write(data, timeout=timeout)
         return self.read(timeout=timeout)
 

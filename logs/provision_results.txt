@@ -1,0 +1,16 @@
+# Provisioning attempt — 2026-02-27 14:19:19
+
+  MSG1: OK (38 bytes)
+  MSG2: OK (68 bytes)
+  Init blob: FAIL (2 bytes)
+  MSG5: OK (52 bytes)
+  HW write: FAIL (2 bytes)
+  HW read: FAIL (2 bytes)
+  Identify: FAIL (2 bytes)
+  Config blob: FAIL (2 bytes)
+  MSG5 (2): OK (52 bytes)
+  MSG5 (3): OK (52 bytes)
+  Partition: FAIL (2 bytes)
+  MSG1 (2): OK (38 bytes)
+  Finalize: FAIL (2 bytes)
+  Commit: FAIL (2 bytes)
