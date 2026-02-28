@@ -16,3 +16,9 @@ logs/*.log
 *.png
 .idea/
 .vscode/
+
+# Capturas USB (grandes, binários)
+Wireshark/
+*.pcap
+*.pcapng
+all_bulk_traffic*.txt
