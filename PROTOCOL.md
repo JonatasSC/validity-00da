@@ -1,6 +1,6 @@
 # Protocol Specification — Synaptics 06cb:00da (FS7605)
 
-> **Last updated:** 2026-02-28
+> **Last updated:** 2026-03-02
 
 ---
 
@@ -11,8 +11,14 @@ It shares some basic commands with the Validity90 family (`138a:0090`, `138a:009
 but has a **fundamentally different firmware** with a different command set for provisioning.
 
 **Current status:** Protocolo de provisioning parcialmente descoberto via captura USB (`teste1.pcap`).
-A fase pre-TLS esta documentada. Certificado proprietario analisado e formato de chaves EC descoberto.
+A fase pre-TLS esta documentada e funciona. Certificado proprietario analisado e formato de chaves EC descoberto.
+TLS handshake parcialmente implementado — bloqueado pelo **cert proof** (32 bytes em offset 0x92).
 A fase de provisioning real ocorre dentro do tunel TLS (criptografada).
+
+**Bloqueador principal:** O campo de 32 bytes no offset 0x92 do certificado proprietario ("cert proof")
+causa `bad_certificate (42)` quando incorreto. O algoritmo de computacao deste campo esta em
+`palCryptoECDSASign` (RVA 0x09A940 na synaTEE108.signed.dll) e ainda nao foi completamente
+reverse-engineered.
 
 ---
 
@@ -400,15 +406,16 @@ Diferencas do Validity90:
 ```
 OUT: 44 00 00 00                          ← header proprietario
      16 03 03 02 2c                       ← TLS Record (Handshake, 556 bytes)
-     0b 00 01 98                          ← Certificate (408 bytes)
-       00 01 90                           ← cert list length (400)
+     0b 00 01 98                          ← Certificate (body=408)
+       00 01 90                           ← cert list length (400, V90 style: == cert_data_len)
        00 01 90                           ← cert length (400)
        50 52 3f 5f 17 00 ...             ← Cert proprietario ("PR?_" header, NÃO X.509)
-       [chave ECDSA em offsets 0x06/0x4a, little-endian]
+       [chave ECDSA em offsets 0x06/0x4c, little-endian]
+       00 00                              ← 2 trailing bytes
      10 00 00 41                          ← ClientKeyExchange (65 bytes)
        04 d6 aa 5c 7a 85 f6 9a 6f ...   ← EC point uncompressed (chave ECDH)
-     0f 00 47                             ← CertificateVerify (71 bytes)
-       00 30 45 02 21 00 cb 9e ad ...    ← Assinatura ECDSA (DER, sem algorithm prefix)
+     0f 00 00 47                          ← CertificateVerify (body=71)
+       30 45 02 21 00 cb 9e ad ...       ← Assinatura ECDSA (DER direto, SEM byte 0x00 prefix)
      14 03 03 00 01 01                    ← ChangeCipherSpec
      16 03 03 00 28                       ← Finished (criptografado com AES-256-GCM, 40 bytes)
        5e ab 11 93 ...
@@ -501,14 +508,20 @@ O certificado enviado pelo host NAO e X.509. E um formato proprietario:
 Offset  Tam   Conteudo
 ------  ----  --------
 0x00    4     Magic: "PR?_" (50 52 3f 5f)
-0x04    2     Flags: 17 00
+0x04    2     Flags: 17 00  (0x17 = secp256r1 curve ID)
 0x06    32    ECDSA Public Key X (little-endian, secp256r1)
 0x26    36    Padding (zeros)
 0x4a    32    ECDSA Public Key Y (little-endian, secp256r1)
-0x6a    294   Padding (quase tudo zeros)
+0x6a    37    Padding (zeros)
+0x8f    35    Extra data (02 20 00 + 32 bytes — cert proof/metadata)
+0xb2    222   Padding (zeros)
 ```
 
 **Total: 400 bytes (0x190), dos quais apenas ~102 bytes sao nao-zero.**
+
+> **Verificado 2026-03-02:** Y esta em **0x4a** (brute-force EC search + P-256 validation).
+> (X@0x06, Y@0x4a) valido em secp256r1; (X@0x06, Y@0x4c) NAO (pega zeros do padding).
+> CertificateVerify validado com chave extraida de offsets 0x06/0x4a.
 
 ### Offsets das Chaves EC
 
@@ -519,7 +532,8 @@ Offset  Tam   Conteudo
 | Byte order | little-endian | little-endian | igual |
 | Header size | 8 bytes | 6 bytes | -2 bytes |
 
-O header do 06cb:00da e 2 bytes menor que o do V90, deslocando todos os offsets.
+O header do 06cb:00da e 2 bytes menor que o V90, deslocando AMBOS os offsets -2 bytes.
+Gap entre X e Y: 36 bytes de zeros (0x26-0x49) vs 36 bytes no V90 (0x28-0x4b).
 
 ### Chaves EC Descobertas (captura teste1.pcap)
 
@@ -584,9 +598,9 @@ Isso confirma que:
 
 ---
 
-## O Que Sabemos Agora (atualizado 2026-02-28)
+## O Que Sabemos Agora (atualizado 2026-03-02)
 
-Com base na captura `teste1.pcap` e analise criptografica dos scripts `parse_cert.py` e `verify_cert_sig.py`:
+Com base na captura `teste1.pcap`, analise criptografica, e tentativas de handshake real:
 
 ### Fatos Confirmados
 
@@ -601,42 +615,54 @@ Com base na captura `teste1.pcap` e analise criptografica dos scripts `parse_cer
 9. **Sensor NAO envia certificado nem ServerKeyExchange** — chave ECDH do sensor e desconhecida
 10. **Sensor pede certificado tipo ecdsa_sign (0x40)** via CertificateRequest
 11. **Apos provisioning via TLS, o enrollment tambem usa TLS** — fingerprint images sao criptografadas
+12. **Nosso ClientHello e aceito** — sensor responde com ServerHello correto (cipher 0xc02e)
+13. **Nenhum EC point encontrado nas respostas pre-TLS** — buscamos em todas (incluindo 3586 bytes do calibration blob)
+
+### Tentativas de Handshake Real (2026-03-02)
+
+Script: `scripts/tls_handshake.py` — Log: `logs/tls_handshake.txt`
+
+#### Fase 1: Correcao estrutural (resolvido)
+
+Erros estruturais iniciais corrigidos via comparacao byte a byte com teste1.pcap:
+1. **ECDSA Y offset corrigido**: Y em **0x4a** (nao 0x4c) — verificado via brute-force EC search
+2. **cert_list_len corrigido**: 400 bytes (V90 style, = cert_data_len)
+3. **2 trailing bytes adicionados**: `00 00` apos cert data (body total = 408)
+4. **CertificateVerify**: DER sig direta, SEM byte `00` prefix (correto!)
+
+Resultado apos correcoes: estrutura aceita, erro muda de `illegal_parameter` para `bad_certificate`.
+
+#### Fase 2: Cert proof (nao resolvido)
+
+Todos os CERT_MODEs testados retornam `bad_certificate (42)`.
+Ver secao "Tentativas de Cert Proof" abaixo para lista completa.
 
 ### Questoes em Aberto
 
-1. **Onde esta a chave ECDH do sensor?** Nao transmitida no handshake. Possibilidades:
+1. **Como computar o cert proof (32 bytes em offset 0x92)?**
+   - palCryptoECDSASign em RVA 0x09A940 da synaTEE108.signed.dll
+   - Nao e ECDSA padrao (saida 32 bytes, nao DER 70-72 bytes)
+   - Nenhuma combinacao testada offline correspondeu ao proof da captura
+2. **Onde esta a chave ECDH do sensor?** Nao transmitida no handshake. Possibilidades:
    - Fixa no firmware (hardcoded)
    - Derivada de algum parametro (factory key + serial?)
-   - Retornada em algum comando pre-TLS que nao identificamos
-   - Sensor aceita handshake sem ECDH real (pre-master = zeros ou derivado diferente)
-2. **O sensor aceita qualquer certificado em state 0x03?** Provavel, mas nao confirmado
+   - SS Public Key (production ou non-production) usada diretamente
 3. **Qual PRF e usada?** SHA-384 (padrao para GCM_SHA384) ou SHA-256 (customizado)?
-4. **Como funciona o GCM neste protocolo?** Nonce implicito + explicito padrao, ou customizado?
-
-### Proximos Passos
-
-1. **Tentar handshake com chaves proprias** (script `try_handshake.py`)
-   - Se sensor responder com Alert: analisar o tipo de erro
-   - Se sensor responder com CCS+Finished: pre-master secret esta correto
-2. **Investigar chave ECDH do sensor**: procurar em respostas pre-TLS ou derivar do firmware
-3. **Se handshake funcionar**: enviar comandos de provisioning dentro do tunel TLS
-4. **Testar com cipher 0xc005 (CBC)** como fallback se GCM nao funcionar
 
 ---
 
 ## Capturas Realizadas
 
-| Arquivo | Bulk transfers | Conteudo |
-|---------|---------------|----------|
-| `teste1.pcap` | 328 | **Pre-TLS + TLS handshake + provisioning + enrollment** |
-| `dozero.pcap` | 428 | Somente TLS Application Data (sensor ja provisionado) |
-| `remocao_drivers.pcap` | 0 (HID only) | Interrupt transfers HID, sem bulk |
-| `tentativa1.pcap` | 0 | Apenas enumeracao USB |
-| `tentativa2.pcap` | 0 (HID only) | Interrupt transfers HID, sem bulk |
-| `lastteste.pcap` | 0 | Apenas 6 control transfers |
-| `lasteteste1.pcap` | 0 | Apenas 6 control transfers |
+| Arquivo | Localizacao | Bulk transfers | Conteudo |
+|---------|-------------|---------------|----------|
+| `teste1.pcap` | **NAO no disco** (copiar do Windows!) | 328 | **Pre-TLS + TLS handshake + provisioning + enrollment** |
+| `captura1.pcap` | `Wireshark/` | muitos | TLS Application Data (sensor ja provisionado) |
+| `captura2.pcap` | `Wireshark/` | poucos | TLS Application Data (sensor ja provisionado) |
+| `captura3.pcap` | `Wireshark/` | muitos | TLS Application Data (sensor ja provisionado) |
 
-Analise detalhada dos payloads: [logs/wireshark_teste1_analysis.txt](logs/wireshark_teste1_analysis.txt)
+**Nenhuma das capturas em `Wireshark/` serve para o handshake** — todas tem sensor ja provisionado.
+
+Analise textual do teste1.pcap: [logs/wireshark_teste1_analysis.txt](logs/wireshark_teste1_analysis.txt)
 
 Ver [USB_CAPTURE_GUIDE.md](USB_CAPTURE_GUIDE.md) para instrucoes de captura.
 
@@ -705,3 +731,120 @@ key_block = TLS-PRF(master_secret, "key expansion", client_random + server_rando
 - 144x144 pixels, 8-bit grayscale
 - 3 chunks via `0x51` command
 - Chunk 1: offset 0x12, Chunks 2-3: offset 0x06
+
+---
+
+## Reverse Engineering do Driver Windows (2026-03-02)
+
+### Arquivos do Driver
+- `bin/instaladores/r1afp04w.exe` — InnoSetup installer (extrair com `innoextract`)
+- `bin/extracted/code$GetExtractPath$/Source/synaTEE108.signed.dll` — TEE DLL principal (1.4MB)
+- `bin/extracted/code$GetExtractPath$/Source/synaWudfBioUsb108.dll` — USB driver DLL
+
+### Funcao _tudorSecuritySignHPubK (RVA 0x72960)
+
+Gera os 32 bytes de "cert proof" no offset 0x92 do certificado:
+
+```
+Passo 1: Recebe cert buffer (400 bytes)
+Passo 2: key_handle_A = palCryptoEccGetKeyHandle(obj+8)      ← privkey do host
+Passo 3: key_handle_B = palCryptoECKeyImport(key_handle_A)   ← pubkey do host (mesma keypair!)
+Passo 4: hash = SHA-256(internal_cert[0:0x8E])               ← 142 bytes internos
+Passo 5: palCryptoECDSASign(key_handle_A, key_handle_B, hash, 32, sig, &sig_len)
+Passo 6: Armazena sig_len em internal_cert[0x8E] (uint16)
+Passo 7: Armazena sig em internal_cert[0x90]                 ← wire offset 0x92
+```
+
+**NOTA:** O buffer interno NAO inclui o prefixo "PR" (2 bytes). Portanto:
+- Internal offset 0x8E = wire offset 0x90
+- Internal offset 0x90 = wire offset 0x92
+- Hash cobre internal[0:0x8E] = wire[2:0x90] = 142 bytes
+
+### palCryptoECDSASign (RVA 0x09A940) — ALGORITMO DESCONHECIDO
+
+Esta funcao e o bloqueador principal. Caracteristicas:
+- Entrada: private key handle, public key handle (da MESMA keypair), hash SHA-256 (32 bytes)
+- Saida: **32 bytes** (NAO e ECDSA padrao que produz DER 70-72 bytes)
+- Usa Intel IPP internamente
+- Ambos os handles vem do mesmo host keypair
+- **Precisa disassembly completo para entender o algoritmo**
+
+### hs_key — Derivacao Verificada
+
+```python
+password = bytes.fromhex('717cd72d0962bc4a2846138dbb2c24192512a76407065f383846139d4bec2033')
+hs_key = tls_prf_sha256(password[:16], "HS_KEY_PAIR_GEN", password[16:] + b'\xaa\xaa', 32)
+# = 866ab3019c09d4352e643fdb60e2e8c74041ae9c47efb0acd6546265b6a2a2e8
+```
+
+**CONFIRMADO: hs_key NÃO é a cert keypair.** Pubkey do hs_key difere da pubkey na captura:
+- Captura cert X: `8ed84571f55b90cc...`
+- hs_key pubkey X: `89e541...`
+
+A keypair do certificado e provavelmente aleatoria (gerada pelo driver na hora).
+
+---
+
+## Tentativas de Cert Proof — Todas Falharam (2026-03-02)
+
+### Teste com sensor real (via tls_handshake.py)
+
+Todas retornaram `bad_certificate (42)`:
+
+| CERT_MODE | Descricao | Resultado |
+|-----------|-----------|-----------|
+| zeros | Zeros no offset 0x92 | bad_certificate |
+| ecdh_x | Coordenada X ECDH | bad_certificate |
+| ecdh_ss_prod | ECDH com SS prod key | bad_certificate |
+| ecdh_ss_nonprod | ECDH com SS nonprod key | bad_certificate |
+| ecdsa_x | Coordenada X ECDSA | bad_certificate |
+| ecdsa_r | ECDSA sign interno, r-value BE | bad_certificate |
+| ecdsa_r (LE) | ECDSA sign interno, r-value LE | bad_certificate |
+| ecdsa_r0 | ECDSA sign, type=0x00 | bad_certificate |
+| ecdsa_r_wire | ECDSA sign wire[0:0x8E] | bad_certificate |
+| hs_key | hs_key como keypair cert+sign | bad_certificate |
+| hs_key (LE) | hs_key, r-value LE | bad_certificate |
+| hs_key0 | hs_key, type=0x00 | bad_certificate |
+
+**Tambem testado `CIPHER_MODE=v90` (cipher 0xc005):**
+- Resultado: `illegal_parameter (47)` — sensor REJEITA 0xc005 em state 0x03
+- Cipher 0xc005 so funciona quando sensor ja esta provisionado
+
+### Verificacao offline contra captura
+
+Proof da captura: `f00b011009485c8cb12439c961afc466a43ec0cbc2f8aa1d1e02a64672b883d4`
+
+Tentativas que NAO produziram match:
+- HMAC-SHA256 com hs_key, password[:16], password[16:], password_full, AES_MASTER
+- ECDH(hs_key, capture_pubkey), ECDH(hs_key, SS_PROD)
+- SHA-256 de combinacoes diversas
+- PRF com labels: "cert sign", "host cert", "sign", "HS_CERT_SIGN", "certificate"
+- Matematica EC: proof*G==h*pubkey, (h*hs_key)%n
+- ECDSA com k=1, k=hash, k=private
+
+**Conclusao:** O algoritmo nao e nenhuma operacao criptografica padrao sobre os dados conhecidos.
+Precisa disassembly do core em RVA 0x09A940 ou mais capturas USB para correlacao.
+
+---
+
+## Status do Projeto (2026-03-02)
+
+### Progresso por Fase
+
+| Fase | Status | % |
+|------|--------|---|
+| Pre-TLS | **COMPLETA** | 100% |
+| TLS ClientHello | **COMPLETO** | 100% |
+| TLS ServerHello parsing | **COMPLETO** | 100% |
+| TLS Certificate format | Formato correto, **cert proof desconhecido** | 80% |
+| TLS CertificateVerify | **CORRETO** (verificado) | 100% |
+| TLS Key Exchange | PMS desconhecido (chave ECDH do sensor) | 30% |
+| TLS Finished | Depende de cert proof + PMS | 0% |
+| Provisioning | Dentro do TLS tunnel, criptografado | 0% |
+
+### Proximos Passos (quando retomar)
+
+1. **Obter mais capturas USB do Windows** com diferentes keypairs para correlacionar cert proof
+2. **OU disassemblar RVA 0x09A940** em synaTEE108.signed.dll
+3. **Depois do cert proof resolvido:** descobrir chave ECDH do sensor para PMS
+4. **Depois do handshake completo:** mapear comandos de provisioning dentro do TLS tunnel

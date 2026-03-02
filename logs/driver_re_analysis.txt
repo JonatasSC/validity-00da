@@ -1,0 +1,203 @@
+═══════════════════════════════════════════════════════════════
+ ANÁLISE DO DRIVER SYNAPTICS USB (r1afp04w / synaWudfBioUsb108)
+ Data: 2026-03-02
+═══════════════════════════════════════════════════════════════
+
+FONTE: bin/instaladores/r1afp04w.exe (InnoSetup)
+DLLs EXTRAÍDOS:
+  - synaWudfBioUsb108.dll (1.5MB) ← DRIVER USB PRINCIPAL (WBDI/UMDF)
+  - synaTEE108.signed.dll (1.3MB) ← TEE com lógica TLS completa
+  - synaWudfBioUsbSGX108.dll (2.5MB) ← versão SGX (Intel enclave)
+  - synaFpAdapter108.dll (188KB) ← adaptador WBF
+  - synaDriverLoader108.dll (114KB) ← loader
+  - sgx_capable.dll (116KB) ← Intel SGX capability check
+  - synaWudfBioUsbUwpSgx.inf ← INF file
+
+═══════════════════════════════════════════════════════════════
+ FAMÍLIA: TUDOR (nome interno do sensor)
+═══════════════════════════════════════════════════════════════
+
+O sensor é chamado internamente de "Tudor family sensor".
+Prefixo das funções: tudor*, ssi*, pal*, vfm*
+
+═══════════════════════════════════════════════════════════════
+ FLUXO TLS (reconstruído a partir de debug strings)
+═══════════════════════════════════════════════════════════════
+
+1. tudorTlsInitCtx() - inicializa contexto TLS
+2. ssiTlsInit() - inicializa SSI TLS
+   - "Only tlsSecurityTypeEcc and tlsSecurityTypePsk are supported"
+3. tudorTlsEstablishSession()
+   → ssiTlsEstablish()
+   → "BEGIN TLS"
+   → "STEP: TlsPrepareValidate"
+   → "STEP: Step 1 of TLS Handshake process" (ClientHello)
+   → "STEP: Step 2 of TLS Handshake process" (resposta)
+   → Se erro: "STEP: TLS Alert generated during the handshake"
+   → Se ok: "STEP: TLS handshake done!"
+   → "END TLS"
+
+4. Após TLS:
+   - ssiTlsWrap() / ssiTlsUnwrap() - encripta/decripta dados
+   - tudorTlsDataGet() / tudorTlsDataRestore()
+
+═══════════════════════════════════════════════════════════════
+ PAIRING / OWNERSHIP (key exchange)
+═══════════════════════════════════════════════════════════════
+
+Fluxo de pairing:
+1. tudorSecurityGetSSPubKey() - obtém SS (Sensor Secret) Public Key
+   - "SS Public Key not found" se não existir
+   - A SSPubKey vem do sensor e é FIXA no firmware
+
+2. _tudorSecurityGenHostKeyPair()
+   - palGenHSPrivKey()
+   - palCryptEccEllipticCurveSet()
+   - palCryptoEccKeypairGenerate()
+   - palCryptoEccExportPublicKey()
+   - palCryptoEccExportPrivateKey()
+   → Gera par de chaves ECC host (efêmero)
+
+3. _tudorSecuritySignHPubK()
+   → Assina a chave pública do host
+
+4. _tudorSecuritySendPairingCommand()
+   → VCSFW_CMD_TAKE_OWNERSHIP_EX2
+   → Envia chave pública assinada + certificado pro sensor
+
+5. _tudorSecuritySensorCertificateValidate()
+   → tudorSecurityGetSSPubKey()
+   → palCryptoEccCreatePublicKeyHandle()
+   → palCryptoECDSAVerify()
+   → Valida certificado do sensor com SSPubKey
+
+6. Resultado salvo como "pairing data"
+   - _tudorSecuritySetPairingData()
+   - tudorSecurityGetPairingData()
+   - _wrapPairingData() / _unwrapPairingData()
+
+═══════════════════════════════════════════════════════════════
+ TLS HANDSHAKE (detalhes internos)
+═══════════════════════════════════════════════════════════════
+
+Estruturas TLS:
+- pTLSClntCtx - contexto do cliente TLS
+- pTLSClntCtx->TLSCtx.cipher_specp - cipher spec
+- pTLSClntCtx->TLSCtx.server_certp - certificado do servidor
+- pTLSClntCtx->TLSCtx.pskp - PSK (pre-shared key)
+- pTLSCtx->client_randomp - random do cliente
+- pTLSCtx->server_randomp - random do servidor
+- pTLSCtx->pEncHPubkey - chave pública do host encriptada
+
+PRF (Pseudo Random Function):
+- prfTLS12() - TLS 1.2 PRF
+- prfAesCmac() - AES-CMAC PRF (alternativo)
+- "master secret" - label para derivar master secret
+- "key expansion" - label para derivar chaves de sessão
+
+Key Exchange:
+- pPreMasterSecret → derivado de ECDH
+- ECDH entre chave efêmera do host e chave pública do sensor
+- "Failed to import Server's public key" → sensor envia pubkey
+- "Failed to export ephemeral ECC public key" → host gera efêmera
+- "ECDH shared key generation failed" → shared secret = PMS
+
+Cripto implementada via:
+- BCrypt (Windows CNG): ECDH, ECDSA, AES
+- IPP (Intel): SHA256, SHA384, AES-GCM, AES-CBC, ECC
+
+═══════════════════════════════════════════════════════════════
+ INSIGHT CRUCIAL: SS PUBLIC KEY
+═══════════════════════════════════════════════════════════════
+
+A "SS Public Key" (Sensor Secret Public Key) é a chave que:
+1. Está gravada no firmware do sensor
+2. É usada para VALIDAR o certificado do sensor
+3. É usada como base para o ECDH (pre-master secret)
+
+O driver obtém ela via tudorSecurityGetSSPubKey()
+Se não encontrada: "SS Public Key not found" → pairing falha
+
+ESTA é a chave que precisamos encontrar no firmware ou
+na captura de tráfego para resolver o ECDH!
+
+═══════════════════════════════════════════════════════════════
+ COMANDOS FIRMWARE (VCSFW_CMD_*)
+═══════════════════════════════════════════════════════════════
+
+VCSFW_CMD_GET_VERSION        - versão do firmware
+VCSFW_CMD_RESET              - reset do sensor
+VCSFW_CMD_PEEK               - ler memória
+VCSFW_CMD_POKE               - escrever memória
+VCSFW_CMD_GET_STARTINFO      - informações de inicialização
+VCSFW_CMD_TAKE_OWNERSHIP_EX2 - tomar posse (pairing)
+VCSFW_CMD_RESET_OWNERSHIP    - resetar posse
+VCSFW_CMD_PROVISION          - provisionar sensor
+VCSFW_CMD_GET_CERTIFICATE_EX - obter certificado
+VCSFW_CMD_FRAME_ACQ          - captura de frame
+VCSFW_CMD_FRAME_READ         - ler frame
+VCSFW_CMD_FRAME_FINISH       - finalizar frame
+VCSFW_CMD_FRAME_STATE_GET    - estado do frame
+VCSFW_CMD_FRAME_STREAM       - stream de frames
+VCSFW_CMD_EVENT_CONFIG       - configurar eventos
+VCSFW_CMD_EVENT_READ         - ler eventos
+VCSFW_CMD_BOOTLDR_PATCH      - patch do bootloader
+VCSFW_CMD_TIDLE_SET          - timeout idle
+VCSFW_CMD_IOTA_FIND          - buscar IOTA (config data)
+VCSFW_CMD_STORAGE_*          - operações de armazenamento
+VCSFW_CMD_LED_EX2            - LED
+VCSFW_CMD_DB2_*              - operações de banco de dados
+VCSFW_CMD_DB_OBJECT_CREATE   - criar objeto no DB
+
+═══════════════════════════════════════════════════════════════
+ ERROS TLS (debug messages)
+═══════════════════════════════════════════════════════════════
+
+"Sensor is not provisioned. Unable to establish TLS"
+"Host has bad certificate. Need to re-pair the sensor."
+"Cipher specs are different: session resuming is not possible."
+"Hashes of handshake messages don't match."
+"Invalid CHANGE_CIPHER_SPEC message."
+"TLS Session is successfully resumed!"
+
+═══════════════════════════════════════════════════════════════
+ RESULTADO CODES RELEVANTES
+═══════════════════════════════════════════════════════════════
+
+VCS_RESULT_SENSOR_NEED_TO_RESET_OWNER
+VCS_RESULT_SENSOR_OUT_OF_OTP_OWNERSHIP
+VCS_RESULT_SENSOR_TLS_INTERNAL_FAILURE
+VCS_RESULT_GEN_SIGNATURE_VERIFICATION_FAILED
+
+═══════════════════════════════════════════════════════════════
+ WINDOWS HELLO CERTIFICATES (embarcados no DLL)
+═══════════════════════════════════════════════════════════════
+
+Microsoft ECC Devices Root Certificate Authority 2017
+Windows Hello Secure Devices PCA 2018
+Windows Hello 19B92965 CA 2018
+Windows Hello 7BB5EEFC CA 2018
+
+Estes são os certificados para validar o sensor via cadeia
+de confiança Microsoft → a SSPubKey provavelmente está
+assinada por esta cadeia.
+
+═══════════════════════════════════════════════════════════════
+ PRÓXIMOS PASSOS
+═══════════════════════════════════════════════════════════════
+
+1. DISASSEMBLAR tudorSecurityGetSSPubKey() no synaWudfBioUsb108.dll
+   para encontrar onde a SSPubKey é armazenada/extraída
+
+2. DISASSEMBLAR a lógica de pairing (_tudorSecuritySendPairingCommand)
+   para entender o formato exato do VCSFW_CMD_TAKE_OWNERSHIP_EX2
+
+3. Verificar se a SSPubKey está embarcada nos certificados
+   Windows Hello (provável)
+
+4. Correlacionar VCSFW_CMD_* com os bytes que vemos na captura
+   teste1.pcap
+
+5. O certificado proprietário do host (400 bytes) é enviado
+   durante o pairing, e os 35 bytes misteriosos podem ser
+   parte da assinatura da SSPubKey
