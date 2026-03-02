@@ -22,3 +22,4 @@ Wireshark/
 *.pcap
 *.pcapng
 all_bulk_traffic*.txt
+.claude

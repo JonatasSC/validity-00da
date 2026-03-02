@@ -1,4 +1,4 @@
-# Provisioning attempt â€” 2026-02-27 14:19:19
+# Provisioning attempt — 2026-02-28 00:28:29
 
   MSG1: OK (38 bytes)
   MSG2: OK (68 bytes)

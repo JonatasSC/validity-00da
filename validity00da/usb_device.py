@@ -38,10 +38,13 @@ class USBDevice:
             self.vid, self.pid, self.dev.bus, self.dev.address,
         )
 
-        # Detach kernel driver if active
-        if self.dev.is_kernel_driver_active(0):
-            log.info("Detaching kernel driver")
-            self.dev.detach_kernel_driver(0)
+        # Detach kernel driver if active (Linux only)
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                log.info("Detaching kernel driver")
+                self.dev.detach_kernel_driver(0)
+        except NotImplementedError:
+            pass  # Not supported on Windows
 
         self.dev.set_configuration()
         usb.util.claim_interface(self.dev, 0)
@@ -67,8 +70,11 @@ class USBDevice:
         if self.dev is None:
             raise RuntimeError("Device not found after USB reset")
 
-        if self.dev.is_kernel_driver_active(0):
-            self.dev.detach_kernel_driver(0)
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+        except NotImplementedError:
+            pass  # Not supported on Windows
 
         self.dev.set_configuration()
         usb.util.claim_interface(self.dev, 0)

@@ -1,0 +1,139 @@
+# Wireshark teste1.pcap - Captura completa do provisioning + TLS handshake
+# Capturado em 2026-02-28
+# Sensor: Synaptics 06cb:00da (device address 6 no pcap)
+# Driver: Synaptics WBF (Windows) - capturado via USBPcap após reboot com sensor em estado 0x03
+
+# ============================================================================
+# FASE 1: PRE-PROVISIONING (t=170.097s)
+# Comandos em claro, sem TLS. Driver lê informações do sensor.
+# ============================================================================
+
+# --- Sequência executada 2x (idêntica) ---
+
+# MSG1: ROM info
+OUT  01
+IN   0000558f215e11d22f000a01014101c100002a8f4eb0705003a1000000000100000000000003
+#    Estado: 0x03 (não provisionado)
+#    Firmware: 558f215e11d22f00
+#    Hardware: 0a01014101c1
+
+# Comando 0x8e sub 0x09: Read sensor info
+OUT  8e09000200000000000000000000000000
+IN   00001400000010000900df0d0000000000000d00000000000000
+
+# Comando 0x8e sub 0x1a: Read sensor config
+OUT  8e1a000200000000000000000000000000
+IN   00004800000044001a00abc20200bec002005b1b00000a00000044004c00640003006b0120030000000010275802a00f6b0300001900190019001900190019001900190019001900190019001900
+#    78 bytes - contém parâmetros de calibração do sensor
+
+# Comando 0x8e sub 0x2e: Read calibration data
+OUT  8e2e000200000000000000000000000000
+IN   [3586 bytes] - Blob grande com dados de calibração (floating point doubles, offsets)
+#    Contém: parâmetros IEEE 754 double, tabelas de lookup, coeficientes de calibração
+
+# Comando 0x8e sub 0x2f: Read firmware info
+OUT  8e2f000200000000000000000000000000
+IN   00000c00000008002f000100000108000000
+
+# MSG2: Query state
+OUT  19
+IN   0000000321020000000000000000000000000000000000005815e30124c600500000000000000000000000000000000000000000000000000000000000000000
+#    64 bytes - Estado detalhado. Byte 4 = 0x03 (não provisionado)
+IN   00000000
+#    4 bytes - Continuação/trailer
+
+# ============================================================================
+# FASE 2: TLS HANDSHAKE (t=170.109s)
+# Header customizado de 4 bytes (44000000) antes do TLS record
+# ============================================================================
+
+# ClientHello (com header customizado 44000000)
+OUT  440000001603030049010000450303090f0de65052acea8d7ff4c5ab34bc4255053320138b39a0ec349a7cf26c3ff30700000000000000000ac005c02e003d008d00a800000a000400020017000b00020100
+#    82 bytes total
+#    Header proprietário: 44 00 00 00
+#    TLS Record: 16 03 03 00 49 (Handshake, TLS 1.2, 73 bytes)
+#    ClientHello: 01 00 00 45 03 03 (version TLS 1.2)
+#    Random: 090f0de65052acea8d7ff4c5ab34bc4255053320138b39a0ec349a7cf26c3ff3
+#    Session ID length: 07 00 (custom?)
+#    Cipher suites: c0 05, c0 2e, 00 3d, 00 8d, 00 a8
+#    Extensions: 00 0a (supported_groups), 00 04, 00 02, 00 17 (secp256r1)
+#                00 0b (ec_point_formats), 00 02, 01 00
+
+# ServerHello
+IN   160303003d0200002d03830001d12fe6b13cb09886795de45836f61d21499a75e0352fdce7b7050860409407544c53e6b13cb0c02e000d000004014000000e000000
+#    66 bytes
+#    TLS Record: 16 03 03 00 3d (Handshake, TLS 1.2, 61 bytes)
+#    ServerHello: 02 00 00 2d 03 83 (version?)
+#    Selected cipher: c0 2e (TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384)
+
+# Certificate + ServerKeyExchange + ServerHelloDone (com header customizado 44000000)
+OUT  44000000160303022c0b00019800019000019050523f5f17000741dacb1007620e582520a2640d4ac25cb45f18ab08fc79cc905bf57145d88e...
+#    616 bytes total
+#    Header proprietário: 44 00 00 00
+#    TLS Record: 16 03 03 02 2c (Handshake, 556 bytes)
+#    Certificate: 0b 00 01 98 (408 bytes)
+#    Contém certificado X.509 do host
+#    Inclui chave pública ECDSA: 04 d6aa5c7a85f69a6f38e2f7815ca0b4a7a41554848e75405d1d9fb713031600...
+#    Assinatura ECDSA: 30 45 02 21 00 cb 9e ad 58 78 d7 ab 2f d3 1d a3 0d 18 0d ad d6...
+#    ChangeCipherSpec do cliente: 14 03 03 00 01 01
+#    Finished do cliente (criptografado): 16 03 03 00 28 5e ab 11 93...
+
+# ChangeCipherSpec + Finished do servidor
+IN   1403030001011603030028cc59938e1d68ad64f93f969113974e5452735b0d52f581d7a35093202040a7ba77aa4f85b0f4849d
+#    51 bytes
+#    ChangeCipherSpec: 14 03 03 00 01 01
+#    Finished (criptografado): 16 03 03 00 28 cc 59 93 8e...
+
+# ============================================================================
+# FASE 3: TLS APPLICATION DATA (t=170.454s - provisioning via TLS)
+# Primeiros comandos após TLS estabelecido - provisioning real
+# ============================================================================
+
+OUT  1703030021f8aad9145bc95ee3083e4b5c92b73cffb31988e39fb03e20a6526a478c8845c71e
+IN   170303003afa75ede5850bf20f8232cd76a4cbddcbf9b3c749296085446bfea9583f55a5818e77810fa63a1454eb12e642cf402bd02e7cef2509f3335a8531
+OUT  1703030021eb6dcd045c84ee4fa87f175a287e1ab190e7bd8fd99cecc01e9d582b210164f6e0
+IN   170303001aae660d5e68098df967fc4461313af715623f467984646a47187a
+OUT  1703030019c5c6bc67eedc41b9bf789f057e7e7aeef47dea0cf75603e113
+IN   170303001ae91a8e1cdd72793e9339d738b5e2a54ef962ffad9f767ee5db2f
+
+# ============================================================================
+# FASE 4: ENROLLMENT (t=205.8s+ - leitura de digitais via TLS)
+# Mesmo padrão do dozero.pcap - ciclos de captura de dedo
+# ============================================================================
+
+# [Continua com padrão TLS Application Data criptografado]
+# Tamanhos típicos: OUT 30/38/46/66, IN 31/47/95/97 bytes
+
+# ============================================================================
+# RESUMO DOS COMANDOS DESCOBERTOS
+# ============================================================================
+#
+# Comandos básicos (1 byte):
+#   0x01 - ROM info (retorna 38 bytes com estado no último byte)
+#   0x19 - Query state (retorna 64+4 bytes com estado detalhado)
+#
+# Comando 0x8e (17 bytes, formato: 8e SS 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00):
+#   0x8e 0x09 - Read sensor info (26 bytes resposta)
+#   0x8e 0x1a - Read sensor config/calibração (78 bytes)
+#   0x8e 0x2e - Read calibration blob (3586 bytes - parâmetros floating point)
+#   0x8e 0x2f - Read firmware version (18 bytes)
+#
+# TLS Handshake:
+#   - Header proprietário de 4 bytes (44 00 00 00) antes dos records TLS do HOST
+#   - Cipher suite selecionada: TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384 (0xc02e)
+#   - Certificado: X.509 com chave ECDSA (secp256r1)
+#   - Sem Server Certificate Request (sensor não pede cert do host)
+#
+# Sequência de provisioning completa:
+#   1. MSG1 (0x01) → verifica estado
+#   2. 0x8e 0x09 → lê info do sensor
+#   3. 0x8e 0x1a → lê config/calibração
+#   4. 0x8e 0x2e → lê blob de calibração (3586 bytes)
+#   5. 0x8e 0x2f → lê versão firmware
+#   6. MSG2 (0x19) → query state detalhado
+#   7. [Repete passos 1-6 uma segunda vez]
+#   8. TLS ClientHello (com header 44000000)
+#   9. TLS ServerHello → cipher c02e
+#   10. Certificate + ChangeCipherSpec + Finished
+#   11. Provisioning via TLS (comandos criptografados)
+#   12. Enrollment (leitura de digitais via TLS)

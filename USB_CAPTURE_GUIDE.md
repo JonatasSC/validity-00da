@@ -25,54 +25,63 @@ Precisamos descobrir:
 
 - Download: https://www.wireshark.org/download.html
 - Na instalacao, marcar **USBPcap** quando perguntar
+- **IMPORTANTE**: Abrir como Administrador para ver interfaces USBPcap
 
 ### 3. Driver do Synaptics (se nao vier pre-instalado)
 
 - Windows Update geralmente instala automaticamente
 - Se nao: Lenovo Vantage ou Lenovo Support site
 - O driver aparece no Device Manager como "Synaptics FP Sensors (WBF) (PID=00da)"
+- **Nota**: O driver pode se reinstalar automaticamente mesmo apos desinstalacao via Device Manager
+
+### 4. Zadig (opcional — para acesso direto via pyusb)
+
+- Download: https://zadig.akeo.ie/
+- Trocar driver do sensor para libusbK
+- **Cuidado**: Com libusbK ativo, Windows Hello nao funciona e nao ha trafego para capturar
 
 ---
 
-## Como capturar
+## Como capturar (metodo comprovado)
 
-### Passo 1: Identificar o bus USB do sensor
+> **Licao aprendida:** O USBPcap so captura bulk transfers de forma confiavel se o Wireshark
+> estiver rodando ANTES do driver ser carregado. A melhor forma e capturar apos reboot.
 
-1. Abrir **Device Manager**
-2. Expandir **Biometric devices** → deve mostrar "Synaptics FP Sensors (WBF) (PID=00da)"
-3. Clicar duas vezes → Properties → Details → **Bus reported device description**
-4. Anotar em qual **USB Root Hub** esta conectado
+### Metodo que funciona (testado — resultou no teste1.pcap)
 
-OU no PowerShell:
+1. **Resetar o sensor** para state 0x03 (usando `scripts/factory_reset.py` com Zadig/libusbK)
+2. **Trocar de volta** para o driver Synaptics (Device Manager → Update Driver → Search automatically)
+3. **Reiniciar a maquina**
+4. **Imediatamente apos o boot**, abrir Wireshark como **Administrador**
+5. Selecionar a interface **USBPcap** do bus correto
+6. **Iniciar captura** — o driver vai provisionar o sensor automaticamente (~18s apos boot)
+7. Ir em **Settings → Accounts → Sign-in options → Fingerprint → Set up**
+8. Completar enrollment (tocar o dedo ~10 vezes)
+9. Parar captura e salvar
+
+### Por que o reboot e necessario
+
+- O USBPcap precisa estar ativo **antes** do driver Synaptics iniciar
+- Se instalar o driver com Wireshark ja rodando, o USBPcap perde os primeiros pacotes
+- O provisioning acontece nos primeiros segundos apos o driver carregar
+- Sem o reboot, voce captura apenas HID interrupt transfers (sem bulk)
+
+### Identificar o bus USB do sensor
+
+No PowerShell:
 ```powershell
 Get-PnpDevice | Where-Object { $_.InstanceId -like "*06CB*00DA*" }
 ```
 
-### Passo 2: Remover pairing anterior (se existir)
+Ou no Device Manager: Biometric devices → "Synaptics FP Sensors (WBF) (PID=00da)"
 
-Se o sensor ja foi configurado antes no Windows, precisa resetar:
-1. **Settings → Accounts → Sign-in options → Fingerprint → Remove**
-2. No Device Manager: desinstalar o device e reinstalar
-3. Idealmente: sensor deve estar em estado "virgem" (state 0x03)
+### Limitacoes conhecidas
 
-### Passo 3: Iniciar captura
-
-1. Abrir **Wireshark**
-2. Na tela inicial, selecionar a interface **USBPcap** do bus correto
-3. **Iniciar captura** (botao play)
-
-### Passo 4: Fazer o setup do fingerprint
-
-1. Ir em **Settings → Accounts → Sign-in options → Fingerprint**
-2. Clicar em **Set up** (ou "Get started")
-3. Seguir o wizard — tocar o dedo no sensor quando pedir
-4. **Completar todo o enrollment** (geralmente pede ~10 toques)
-
-### Passo 5: Parar captura e salvar
-
-1. Parar a captura no Wireshark
-2. **File → Save As** → salvar como `fingerprint_setup.pcapng`
-3. Copiar o arquivo pro Linux
+- **tshark**: Nao consegue abrir interface USBPcap diretamente (`error -5`). Usar GUI do Wireshark.
+- **USBPcap mid-session**: Se o driver for instalado DEPOIS do Wireshark iniciar captura,
+  os bulk transfers podem nao ser capturados (apenas control + interrupt).
+- **WSL2**: O kernel WSL2 nao inclui o modulo `usbmon`, entao nao da para capturar USB no WSL2.
+  O sensor funciona via `usbipd-win` mas sem captura.
 
 ---
 
@@ -114,40 +123,50 @@ No painel de detalhes, expandir **USB URB** → **Leftover Capture Data** mostra
 
 ## O que procurar na captura
 
-### Fase 1: Identificacao (raw, antes do TLS)
+### Filtrar bulk transfers do sensor
 
-Procurar os primeiros bulk OUT packets. Devem comecar com:
-- `01` → RSP1 (38 bytes) — verifica que retorna state=0x03
-- `19` → RSP2 (68 bytes)
-- `3e` → RSP5 (52 bytes)
+Primeiro, descobrir o device address. Pode mudar se o sensor re-enumerar (no teste1.pcap mudou de 4 para 6).
 
-Esses ja conhecemos. O **importante** e o que vem DEPOIS.
+```
+usb.transfer_type == 3 && usb.device_address == 6
+```
 
-### Fase 2: Provisioning (o que nao sabemos)
+### Fase 1: Pre-TLS (comandos em claro)
 
-Depois dos comandos conhecidos, o driver vai enviar comandos que nao reconhecemos.
-Prestar atencao em:
+Primeiros bulk transfers. Sequencia executada 2x:
 
-1. **Comandos novos** — bytes que nao sao `01`, `19`, `3e`
-2. **Payloads grandes** (>100 bytes) — provavelmente certificados ou blobs criptografados
-3. **Mudanca de estado** — apos algum comando, o sensor vai mudar de state 0x03 para outro
-4. **Sequencia de `0x44`** — quando o TLS comecar (Client Hello, Server Hello, etc.)
+| # | OUT | IN | Descricao |
+|---|-----|-----|-----------|
+| 1 | `01` | 38 bytes | ROM info, state=0x03 |
+| 2 | `8e 09 00 02 00...` (17 bytes) | 26 bytes | Sensor info |
+| 3 | `8e 1a 00 02 00...` (17 bytes) | 78 bytes | Config/calibracao |
+| 4 | `8e 2e 00 02 00...` (17 bytes) | 3586 bytes | Calibration blob |
+| 5 | `8e 2f 00 02 00...` (17 bytes) | 18 bytes | Firmware version |
+| 6 | `19` | 64+4 bytes | Query state |
 
-### Fase 3: TLS Handshake
+### Fase 2: TLS Handshake
 
-Apos provisioning, o driver vai iniciar TLS:
-- Envio de `0x44` (ou similar) para entrar em modo TLS
-- Client Hello (`16 03 03...`)
-- Server Hello + Certificate + Key Exchange
-- Finished
+Apos a fase 1 (repetida 2x), o driver inicia TLS:
 
-### Fase 4: Comandos de scan (sobre TLS)
+| # | Direcao | Conteudo | Bytes |
+|---|---------|----------|-------|
+| 1 | OUT | `44 00 00 00` + ClientHello | 82 |
+| 2 | IN | ServerHello | 66 |
+| 3 | OUT | `44 00 00 00` + Certificate + ChangeCipherSpec + Finished | 616 |
+| 4 | IN | ChangeCipherSpec + Finished | 51 |
 
-Ja dentro da sessao TLS (dados criptografados):
-- Setup de LED
-- Configuracao de scan
-- Leitura de imagem
-- Esses dados serao criptografados (AES-256-CBC)
+**Nota**: Records do host tem header `44 00 00 00`. Records do sensor NAO tem.
+
+### Fase 3: Provisioning via TLS
+
+Application Data criptografado (`17 03 03 ...`). Tamanhos tipicos:
+- OUT: 33, 33, 25 bytes
+- IN: 58, 26, 26 bytes
+
+### Fase 4: Enrollment (fingerprint scan via TLS)
+
+Continua com Application Data criptografado, com ciclos maiores de captura de dedo.
+No dozero.pcap: 9 ciclos de ~14631 bytes cada.
 
 ---
 
@@ -182,21 +201,24 @@ que vai parsear o .pcapng e extrair a sequencia de comandos automaticamente.
 
 ## Dicas
 
-- **Capturar o PRIMEIRO setup** — e o mais importante porque inclui o provisioning completo
-- Se possivel, fazer uma **segunda captura** de um login normal (apos setup) pra comparar
-- O arquivo .pcapng pode ser grande (10-50 MB) — normal
-- Se o sensor ja estiver provisionado pelo Windows e quiser capturar o provisioning do zero,
-  pode ser necessario fazer reset de fabrica ou reinstalar o Windows
-- **NAO instalar** python-validity ou open-fprintd no Linux antes/depois — pode confundir o estado do sensor
+- **Capturar o PRIMEIRO setup apos reboot** — e o mais importante porque inclui provisioning + TLS
+- O `factory_reset.py` precisa de libusbK (Zadig) ativo para funcionar
+- Apos reset, trocar de volta para driver Synaptics e reiniciar
+- O arquivo .pcap pode ser grande (50-100 MB com todos os pacotes) — filtrar por bulk do sensor
+- **NAO instalar** python-validity ou open-fprintd no Linux — pode confundir o estado
+- O driver Synaptics pode se reinstalar automaticamente via Windows Update mesmo apos desinstalacao
 
 ---
 
-## Resultado esperado
+## Resultado obtido (teste1.pcap)
 
-Apos a captura, teremos:
-1. A sequencia completa de comandos de provisioning
-2. Os payloads exatos (incluindo blobs criptografados)
-3. O formato correto do TLS handshake para este sensor
-4. Os comandos de scan/enroll
+Captura bem-sucedida incluindo:
+1. Sequencia completa pre-TLS (comando `0x8e` com 4 subcomandos)
+2. TLS handshake completo (ClientHello → ServerHello → Certs → Finished)
+3. Cipher suite real: `TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384` (0xc02e)
+4. Provisioning e enrollment via TLS (criptografado)
 
-Com isso, podemos implementar o provisioning no nosso projeto Python.
+**Proximo desafio**: Descriptografar o trafego TLS para ver os comandos reais de provisioning.
+Opcoes:
+- Extrair session keys do driver Windows (SSLKEYLOGFILE ou similar)
+- Reimplementar o handshake e derivar as keys a partir do certificado capturado
