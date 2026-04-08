@@ -326,7 +326,7 @@ def pre_tls_phase(dev, log, round_num=1):
 # TLS Handshake
 # =============================================================
 
-def do_tls_handshake(dev, log):
+def do_tls_handshake(dev, log, pairing_data=None):
     """Realiza TLS handshake. Retorna True/False/'keys_wrong'."""
 
     # ── Gerar key pairs ──
@@ -455,8 +455,13 @@ def do_tls_handshake(dev, log):
         return False
 
     use_gcm = (selected_cipher == 0xc02e)
-    prf = tls_prf_sha384 if use_gcm else tls_prf_sha256
-    log.info(f"Modo: {'AES-256-GCM + SHA384' if use_gcm else 'AES-256-CBC + SHA256'}")
+    force_sha256 = os.environ.get("FORCE_SHA256", "0") == "1"
+    if force_sha256:
+        prf = tls_prf_sha256
+        log.info(f"Modo: AES-256-GCM + FORCED SHA256 (ignore cipher spec)")
+    else:
+        prf = tls_prf_sha384 if use_gcm else tls_prf_sha256
+        log.info(f"Modo: {'AES-256-GCM + SHA384' if use_gcm else 'AES-256-CBC + SHA256'}")
 
     # ── Construir resposta ──
     log.separator()
@@ -475,7 +480,30 @@ def do_tls_handshake(dev, log):
     cert_mode = os.environ.get("CERT_MODE", "ecdh_ss_prod")
     log.info(f"  Cert mode: {cert_mode}")
 
-    if cert_mode == "capture":
+    if cert_mode == "paired":
+        # ============================================================
+        # PAIRED mode: Use pairing data from pre-TLS PAIR (0x93)
+        # PAIR was done in main() before TLS, so pairing_data is passed in
+        # ============================================================
+        if pairing_data is None:
+            log.error("  paired mode mas pairing_data e None!")
+            return False
+
+        # Use pairing privkey for ECDSA (cert identity + CV signing)
+        ecdsa_privkey = pairing_data["privkey"]
+        ecdsa_pub = ecdsa_privkey.public_key().public_numbers()
+        ecdsa_x = ecdsa_pub.x.to_bytes(32, 'big')
+        ecdsa_y = ecdsa_pub.y.to_bytes(32, 'big')
+        log.info(f"  Using pairing privkey (X: {ecdsa_x[:16].hex()}...)")
+
+        cert_raw = pairing_data["tls_cert"]
+        log.info(f"  TLS cert: {len(cert_raw)}B (starts with {cert_raw[:6].hex()})")
+
+        _paired_sensor_x = pairing_data["sensor_x"]
+        _paired_sensor_y = pairing_data["sensor_y"]
+        log.info(f"  Sensor X: {_paired_sensor_x.hex()}")
+
+    elif cert_mode == "capture":
         # Use exact cert bytes from teste1.pcap — diagnostic test
         # If sensor still says bad_certificate → cert format is not the issue
         # If sensor says decrypt_error → cert accepted! (CV will fail since key mismatch)
@@ -690,6 +718,186 @@ def do_tls_handshake(dev, log):
         cert_raw = bytes(cert_raw)
         log.info(f"  ECDSA-r-wire cert: {len(cert_raw)} bytes")
         log.hex_dump("ECDSA-r-wire cert", cert_raw)
+    elif cert_mode in ("synaTudor", "synaTudor_self"):
+        # ============================================================
+        # synaTudor mode — based on Popax21/synaTudor reverse engineering
+        # Key insight: cert proof is FULL DER ECDSA signature, NOT 32 bytes!
+        #
+        # synaTudor format (SensorCertificate):
+        #   signbytes = cert_raw[2:0x90] (142 bytes, excludes "PR" prefix)
+        #   signature = hs_key.sign(signbytes, ECDSA(SHA256))  ← STANDARD, not prehashed
+        #   sig_len at cert[0x90:0x92] = uint16 LE (actual DER sig length)
+        #   signature at cert[0x92:] = full DER ECDSA signature (70-72 bytes)
+        #   cert_type at cert[0x8f] = 0x00
+        #
+        # In synaTudor mode: cert signed by hs_key, cert pubkey = random ecdsa key
+        # In synaTudor_self mode: cert signed by its own key (self-signed)
+        # ============================================================
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature as _decode_sig
+
+        # Derive hs_key
+        pw = bytes.fromhex('717cd72d0962bc4a2846138dbb2c24192512a76407065f383846139d4bec2033')
+        hs_key_bytes = tls_prf_sha256(pw[:16], "HS_KEY_PAIR_GEN", pw[16:] + b'\xaa\xaa', 32)
+        hs_key_int = int(hs_key_bytes[::-1].hex(), 16)  # LE interpretation
+        hs_privkey = ec.derive_private_key(hs_key_int, ec.SECP256R1(), default_backend())
+        hs_pub = hs_privkey.public_key().public_numbers()
+        log.info(f"  HS pubkey X: {hs_pub.x.to_bytes(32, 'big').hex()}")
+        log.info(f"  HS pubkey Y: {hs_pub.y.to_bytes(32, 'big').hex()}")
+
+        # Build cert with the ECDSA keypair's public key (random, generated above)
+        # cert pubkey ≠ hs_key (unless synaTudor_self)
+        cert_raw = bytearray(0x190)  # 400 bytes
+        cert_raw[0:4] = b"PR\x3f\x5f"
+        cert_raw[4:6] = b"\x17\x00"
+        cert_raw[0x06:0x26] = ecdsa_x[::-1]  # X in LE
+        cert_raw[0x4a:0x6a] = ecdsa_y[::-1]  # Y in LE
+        # cert_type: 0x00 (synaTudor default) or 0x02 (capture format)
+        ct = int(os.environ.get("CERT_TYPE", "0"), 0)
+        cert_raw[0x8f] = ct
+        log.info(f"  cert_type: 0x{ct:02x}")
+
+        # signbytes = cert[2:0x90] — 142 bytes (magic + curve + X + Y + pad + type)
+        signbytes = bytes(cert_raw[2:0x90])
+        log.info(f"  signbytes ({len(signbytes)} bytes): {signbytes[:16].hex()}...{signbytes[-4:].hex()}")
+
+        # Sign with appropriate key
+        if cert_mode == "synaTudor":
+            # Signed by hs_key — sensor can verify because it knows hs_key
+            signing_key = hs_privkey
+            log.info("  Signing cert with HS_KEY (CA model)")
+        else:
+            # Self-signed — signed by the cert's own keypair
+            signing_key = ecdsa_privkey
+            log.info("  Signing cert with ECDSA key (self-signed)")
+
+        # Standard ECDSA-SHA256 (NOT prehashed!) — matching synaTudor exactly
+        der_sig = signing_key.sign(signbytes, ec.ECDSA(hashes.SHA256()))
+        r_int, s_int = _decode_sig(der_sig)
+        log.info(f"  DER signature: {len(der_sig)} bytes")
+        log.info(f"  ECDSA r: {r_int.to_bytes(32, 'big').hex()}")
+        log.info(f"  ECDSA s: {s_int.to_bytes(32, 'big').hex()}")
+        log.hex_dump("DER sig", der_sig)
+
+        # Store sig_len (uint16 LE) at cert[0x90:0x92]
+        struct.pack_into("<H", cert_raw, 0x90, len(der_sig))
+        # Store full DER signature at cert[0x92:]
+        cert_raw[0x92:0x92 + len(der_sig)] = der_sig
+        log.info(f"  sig_len stored: {len(der_sig)} (0x{len(der_sig):04x})")
+
+        cert_raw = bytes(cert_raw)
+        log.info(f"  synaTudor cert: {len(cert_raw)} bytes")
+        log.hex_dump("synaTudor cert", cert_raw)
+
+    elif cert_mode == "synaTudor_hskey":
+        # Same as synaTudor but cert pubkey = hs_key's pubkey
+        # (host uses hs_key for everything: cert key, signing, CV)
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature as _decode_sig
+
+        pw = bytes.fromhex('717cd72d0962bc4a2846138dbb2c24192512a76407065f383846139d4bec2033')
+        hs_key_bytes = tls_prf_sha256(pw[:16], "HS_KEY_PAIR_GEN", pw[16:] + b'\xaa\xaa', 32)
+        hs_key_int = int(hs_key_bytes[::-1].hex(), 16)
+        hs_privkey = ec.derive_private_key(hs_key_int, ec.SECP256R1(), default_backend())
+        hs_pub = hs_privkey.public_key().public_numbers()
+        hs_x = hs_pub.x.to_bytes(32, 'big')
+        hs_y = hs_pub.y.to_bytes(32, 'big')
+        log.info(f"  HS pubkey X: {hs_x.hex()}")
+        log.info(f"  HS pubkey Y: {hs_y.hex()}")
+
+        # OVERRIDE ecdsa keypair with hs_key
+        ecdsa_privkey = hs_privkey
+        ecdsa_pub = hs_pub
+        ecdsa_x = hs_x
+        ecdsa_y = hs_y
+        log.info("  OVERRIDING ecdsa_privkey with hs_key!")
+
+        cert_raw = bytearray(0x190)
+        cert_raw[0:4] = b"PR\x3f\x5f"
+        cert_raw[4:6] = b"\x17\x00"
+        cert_raw[0x06:0x26] = hs_x[::-1]
+        cert_raw[0x4a:0x6a] = hs_y[::-1]
+        ct = int(os.environ.get("CERT_TYPE", "0"), 0)
+        cert_raw[0x8f] = ct
+        log.info(f"  cert_type: 0x{ct:02x}")
+
+        signbytes = bytes(cert_raw[2:0x90])
+        log.info(f"  signbytes ({len(signbytes)} bytes)")
+
+        # Self-signed with hs_key (same key for cert and signature)
+        der_sig = hs_privkey.sign(signbytes, ec.ECDSA(hashes.SHA256()))
+        r_int, s_int = _decode_sig(der_sig)
+        log.info(f"  DER signature: {len(der_sig)} bytes")
+        log.info(f"  ECDSA r: {r_int.to_bytes(32, 'big').hex()}")
+        log.info(f"  ECDSA s: {s_int.to_bytes(32, 'big').hex()}")
+
+        struct.pack_into("<H", cert_raw, 0x90, len(der_sig))
+        cert_raw[0x92:0x92 + len(der_sig)] = der_sig
+
+        cert_raw = bytes(cert_raw)
+        log.info(f"  synaTudor_hskey cert: {len(cert_raw)} bytes")
+        log.hex_dump("synaTudor_hskey cert", cert_raw)
+
+    elif cert_mode in ("ecdsa_s", "ecdsa_s0", "hs_key_s", "hs_key_s0"):
+        # ============================================================
+        # S-value modes — extract ECDSA S component instead of R
+        # We tried R-value extensively and it never worked.
+        # The 32-byte proof in the capture (f00b0110...) is NOT DER,
+        # so it's either R or S from an ECDSA signature.
+        #
+        # ecdsa_s:  random key, cert_type=0x02, s-value BE
+        # ecdsa_s0: random key, cert_type=0x00, s-value BE
+        # hs_key_s:  hs_key for sign+cert, cert_type=0x02, s-value BE
+        # hs_key_s0: hs_key for sign+cert, cert_type=0x00, s-value BE
+        # ============================================================
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature as _decode_sig
+        from cryptography.hazmat.primitives.asymmetric.utils import Prehashed as _Prehash
+
+        use_hskey = cert_mode.startswith("hs_key_s")
+
+        if use_hskey:
+            pw = bytes.fromhex('717cd72d0962bc4a2846138dbb2c24192512a76407065f383846139d4bec2033')
+            hs_key_bytes = tls_prf_sha256(pw[:16], "HS_KEY_PAIR_GEN", pw[16:] + b'\xaa\xaa', 32)
+            hs_key_int = int(hs_key_bytes[::-1].hex(), 16)
+            hs_privkey = ec.derive_private_key(hs_key_int, ec.SECP256R1(), default_backend())
+            hs_pub = hs_privkey.public_key().public_numbers()
+            # Override ECDSA keypair
+            ecdsa_privkey = hs_privkey
+            ecdsa_pub = hs_pub
+            ecdsa_x = hs_pub.x.to_bytes(32, 'big')
+            ecdsa_y = hs_pub.y.to_bytes(32, 'big')
+            log.info(f"  Using hs_key as cert keypair")
+            log.info(f"  HS pubkey X: {ecdsa_x.hex()}")
+
+        cert_raw = bytearray(build_proprietary_cert(ecdsa_x, ecdsa_y, ecdh_x_be=None))
+
+        # cert_type
+        if cert_mode.endswith("0"):
+            cert_raw[0x8f] = 0x00
+        else:
+            cert_raw[0x8f] = 0x02
+
+        # Sign signbytes — standard ECDSA-SHA256 (NOT prehashed)
+        signbytes = bytes(cert_raw[2:0x90])
+        der_sig = ecdsa_privkey.sign(signbytes, ec.ECDSA(hashes.SHA256()))
+        r_int, s_int = _decode_sig(der_sig)
+        s_bytes = s_int.to_bytes(32, 'big')
+        r_bytes = r_int.to_bytes(32, 'big')
+        log.info(f"  ECDSA r (BE): {r_bytes.hex()}")
+        log.info(f"  ECDSA s (BE): {s_bytes.hex()}")
+
+        # Store s-value at cert[0x92]
+        cert_raw[0x90] = 0x20  # sig_len low
+        cert_raw[0x91] = 0x00  # sig_len high
+        store_le = os.environ.get("CERT_R_LE", "0") == "1"
+        if store_le:
+            cert_raw[0x92:0xB2] = s_bytes[::-1]
+            log.info("  Storing S-value in LE")
+        else:
+            cert_raw[0x92:0xB2] = s_bytes
+            log.info("  Storing S-value in BE")
+        cert_raw = bytes(cert_raw)
+        log.info(f"  {cert_mode} cert: {len(cert_raw)} bytes")
+        log.hex_dump(f"{cert_mode} cert", cert_raw)
+
     elif cert_mode == "v90":
         # V90 style: 184-byte cert body only (no embedded sig)
         # Matching ThinkPad-E14-fingerprint spec:
@@ -780,35 +988,92 @@ def do_tls_handshake(dev, log):
     # CCS
     msg += b"\x14\x03\x03\x00\x01\x01"
 
-    # Pre-master secret via ECDH with sensor's SS Public Key
+    # Pre-master secret via ECDH
     log.info("Calculando pre-master secret via ECDH")
-    try:
-        pms = compute_ecdh_premaster(ecdh_privkey, SS_PUBKEY_PROD)
-        log.info(f"  PMS (production key): {pms.hex()}")
-    except Exception as e:
-        log.error(f"  ECDH falhou com production key: {e}")
-        try:
+    if cert_mode == "paired" and '_paired_sensor_x' in dir():
+        # After pairing, try different ECDH keys
+        paired_ecdh = os.environ.get("PAIRED_ECDH", "sensor")
+        if paired_ecdh == "ss_prod":
+            log.info("  ECDH com SS_PUBKEY_PROD (hardcoded)")
+            pms = compute_ecdh_premaster(ecdh_privkey, SS_PUBKEY_PROD)
+            log.info(f"  PMS (SS prod): {pms.hex()}")
+        elif paired_ecdh == "ss_nonprod":
+            log.info("  ECDH com SS_PUBKEY_NONPROD")
             pms = compute_ecdh_premaster(ecdh_privkey, SS_PUBKEY_NONPROD)
-            log.info(f"  PMS (non-production key): {pms.hex()}")
-        except Exception as e2:
-            log.error(f"  ECDH falhou com non-production key: {e2}")
-            pms = b"\x00" * 32
-            log.warn("  Usando PMS dummy (zeros)")
+            log.info(f"  PMS (SS nonprod): {pms.hex()}")
+        elif paired_ecdh == "hs_key":
+            # hs_key is known to both host and sensor
+            log.info("  ECDH com hs_key pubkey")
+            pw = bytes.fromhex('717cd72d0962bc4a2846138dbb2c24192512a76407065f383846139d4bec2033')
+            hs_key_bytes = tls_prf_sha256(pw[:16], "HS_KEY_PAIR_GEN", pw[16:] + b'\xaa\xaa', 32)
+            hs_key_int = int(hs_key_bytes[::-1].hex(), 16)
+            _hs = ec.derive_private_key(hs_key_int, ec.SECP256R1(), default_backend())
+            _hs_pub = _hs.public_key().public_numbers()
+            hs_dict = {"x": _hs_pub.x.to_bytes(32, 'big'), "y": _hs_pub.y.to_bytes(32, 'big')}
+            pms = compute_ecdh_premaster(ecdh_privkey, hs_dict)
+            log.info(f"  PMS (hs_key): {pms.hex()}")
+        elif paired_ecdh == "cert":
+            # Use the ECDSA/cert private key for ECDH (TLS_ECDH standard)
+            log.info("  ECDH com cert privkey (standard ECDH_ECDSA)")
+            sensor_pubkey_dict = {"x": _paired_sensor_x, "y": _paired_sensor_y}
+            sx = int.from_bytes(_paired_sensor_x, "big")
+            sy = int.from_bytes(_paired_sensor_y, "big")
+            sensor_pub = EllipticCurvePublicNumbers(sx, sy, ec.SECP256R1()).public_key(default_backend())
+            pms = ecdsa_privkey.exchange(ECDH(), sensor_pub)
+            log.info(f"  PMS (cert ECDH): {pms.hex()}")
+        else:
+            log.info("  ECDH com sensor pubkey do PAIRING")
+            sensor_pubkey_dict = {
+                "x": _paired_sensor_x,
+                "y": _paired_sensor_y,
+            }
+            try:
+                pms = compute_ecdh_premaster(ecdh_privkey, sensor_pubkey_dict)
+                log.info(f"  PMS (sensor cert key): {pms.hex()}")
+            except Exception as e:
+                log.error(f"  ECDH falhou com sensor cert key: {e}")
+                pms = compute_ecdh_premaster(ecdh_privkey, SS_PUBKEY_PROD)
+                log.info(f"  PMS (fallback SS prod): {pms.hex()}")
+    else:
+        try:
+            pms = compute_ecdh_premaster(ecdh_privkey, SS_PUBKEY_PROD)
+            log.info(f"  PMS (production key): {pms.hex()}")
+        except Exception as e:
+            log.error(f"  ECDH falhou com production key: {e}")
+            try:
+                pms = compute_ecdh_premaster(ecdh_privkey, SS_PUBKEY_NONPROD)
+                log.info(f"  PMS (non-production key): {pms.hex()}")
+            except Exception as e2:
+                log.error(f"  ECDH falhou com non-production key: {e2}")
+                pms = b"\x00" * 32
+                log.warn("  Usando PMS dummy (zeros)")
 
     seed = client_random + server_random
     master_secret = prf(pms, "master secret", seed, 48)
 
+    # synaTudor deviation: key_expansion uses client_random + server_random
+    # (standard TLS 1.2 uses server_random + client_random)
+    tudor_seed = os.environ.get("TUDOR_SEED", "1") == "1"
+    if tudor_seed:
+        key_seed = client_random + server_random
+        log.info("  key_expansion seed: client+server (synaTudor)")
+    else:
+        key_seed = server_random + client_random
+        log.info("  key_expansion seed: server+client (standard TLS)")
+
     if use_gcm:
-        key_block = prf(master_secret, "key expansion", server_random + client_random, 72)
+        key_block = prf(master_secret, "key expansion", key_seed, 128)
         client_write_key = key_block[0:32]
         client_write_iv = key_block[64:68]
     else:
-        key_block = prf(master_secret, "key expansion", server_random + client_random, 160)
+        key_block = prf(master_secret, "key expansion", key_seed, 160)
         client_write_key = key_block[64:96]
         client_write_iv = key_block[128:144]
 
-    finished_hash = hs_sha384.digest() if use_gcm else hs_sha256.digest()
+    # synaTudor: transcript hash is ALWAYS SHA-256, PRF uses cipher's hash (SHA-384 for GCM)
+    finished_hash = hs_sha256.digest()  # Always SHA-256 transcript
     verify_data = prf(master_secret, "client finished", finished_hash, 12)
+    log.info(f"  Finished: SHA-256 transcript → PRF ({'SHA384' if use_gcm and not force_sha256 else 'SHA256'})")
     finished_plaintext = b"\x14\x00\x00\x0c" + verify_data
 
     if use_gcm:
@@ -985,11 +1250,96 @@ def main():
         else:
             log.info("Nenhum EC point encontrado")
 
+        # ── Fase 1.5: PAIR (if paired mode) ──
+        pairing_data = None
+        cert_mode = os.environ.get("CERT_MODE", "ecdh_ss_prod")
+        if cert_mode == "paired":
+            log.separator()
+            log.info("FASE 1.5: PAIR (cmd 0x93)")
+
+            # Derive hs_key
+            pw = bytes.fromhex('717cd72d0962bc4a2846138dbb2c24192512a76407065f383846139d4bec2033')
+            hs_key_bytes = tls_prf_sha256(pw[:16], "HS_KEY_PAIR_GEN", pw[16:] + b'\xaa\xaa', 32)
+            hs_key_int = int(hs_key_bytes[::-1].hex(), 16)
+            hs_privkey = ec.derive_private_key(hs_key_int, ec.SECP256R1(), default_backend())
+
+            # Generate host keypair for pairing
+            pair_privkey = ec.generate_private_key(ec.SECP256R1(), default_backend())
+            pair_pub = pair_privkey.public_key().public_numbers()
+            pair_x = pair_pub.x.to_bytes(32, 'big')
+            pair_y = pair_pub.y.to_bytes(32, 'big')
+            log.info(f"  Pair host X: {pair_x.hex()}")
+
+            # Build synaTudor cert (no PR, 400B)
+            pair_cert = bytearray(400)
+            struct.pack_into("<HH", pair_cert, 0, 0x5f3f, 23)
+            pair_cert[4:36] = pair_x[::-1]
+            pair_cert[72:104] = pair_y[::-1]
+            pair_cert[141] = 0x00
+            pair_signbytes = bytes(pair_cert[0:142])
+            pair_der_sig = hs_privkey.sign(pair_signbytes, ec.ECDSA(hashes.SHA256()))
+            struct.pack_into("<H", pair_cert, 142, len(pair_der_sig))
+            pair_cert[144:144 + len(pair_der_sig)] = pair_der_sig
+            log.info(f"  PAIR cert: DER sig {len(pair_der_sig)}B")
+
+            # Send PAIR
+            dev.write(b"\x93" + bytes(pair_cert))
+            pair_rsp = dev.read(timeout=10000)
+
+            if pair_rsp and len(pair_rsp) >= 802 and pair_rsp[0:2] == b"\x00\x00":
+                log.info("  *** PAIR OK! ***")
+                host_echo = pair_rsp[2:402]
+                sensor_cert = pair_rsp[402:802]
+
+                # Extract sensor pubkey
+                sensor_x = sensor_cert[4:36][::-1]   # LE → BE
+                sensor_y = sensor_cert[72:104][::-1]
+                log.info(f"  Sensor X: {sensor_x.hex()}")
+                log.info(f"  Sensor Y: {sensor_y.hex()}")
+                log.hex_dump("Host cert echo", host_echo)
+                log.hex_dump("Sensor cert", sensor_cert)
+
+                # Build TLS cert: "PR" + echo[0:398] = 400 bytes
+                tls_cert = b"PR" + bytes(host_echo[0:398])
+                log.info(f"  TLS cert: {len(tls_cert)}B (starts with {tls_cert[:6].hex()})")
+
+                # Save pairing data
+                pair_dir = os.path.join(LOG_DIR, "pairing")
+                os.makedirs(pair_dir, exist_ok=True)
+                with open(os.path.join(pair_dir, "host_cert.bin"), "wb") as f:
+                    f.write(host_echo)
+                with open(os.path.join(pair_dir, "sensor_cert.bin"), "wb") as f:
+                    f.write(sensor_cert)
+
+                pairing_data = {
+                    "privkey": pair_privkey,
+                    "tls_cert": tls_cert,
+                    "sensor_x": sensor_x,
+                    "sensor_y": sensor_y,
+                }
+
+                # After PAIR, reset and re-initialize (synaTudor flow)
+                log.separator()
+                log.info("FASE 1.6: Reset + Re-init apos PAIR")
+                dev.reset()
+                time.sleep(1)
+                r3 = pre_tls_phase(dev, log, round_num=3)
+                time.sleep(0.1)
+                r4 = pre_tls_phase(dev, log, round_num=4)
+
+                # Check new state
+                if "rom_info" in r3 and len(r3["rom_info"]) >= 38:
+                    new_state = r3["rom_info"][-1]
+                    log.info(f"  Estado apos PAIR+reset: 0x{new_state:02x}")
+            else:
+                status = pair_rsp[0:2].hex() if pair_rsp else "timeout"
+                log.error(f"  PAIR falhou: {status}")
+
         # ── Fase 2: TLS Handshake ──
         log.separator()
         log.info("FASE 2: TLS Handshake")
 
-        result = do_tls_handshake(dev, log)
+        result = do_tls_handshake(dev, log, pairing_data=pairing_data)
 
         log.separator()
         if result is True:

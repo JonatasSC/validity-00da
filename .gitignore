@@ -24,3 +24,5 @@ Wireshark/
 all_bulk_traffic*.txt
 .claude
 bin
+Ghidra
+docs

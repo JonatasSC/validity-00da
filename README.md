@@ -13,8 +13,8 @@ Based on reverse engineering from the [Validity90](https://github.com/nmikhailov
 | 2 | USB capture — provisioning protocol | Done (teste1.pcap) |
 | 3 | Protocolo pre-TLS documentado (`0x8e` subs) | Done |
 | 3.5 | Analise do certificado e chaves EC | Done |
-| 4 | TLS handshake (cipher `0xc02e` GCM) | Em progresso |
-| 5 | Provisioning via TLS tunnel | Pendente |
+| 4 | TLS handshake (cipher `0xc02e` GCM) | Done |
+| 5 | Provisioning via TLS tunnel | Em progresso (tunnel funcional) |
 | 6 | Enrollment (fingerprint scan) | Pendente |
 
 ## Setup
