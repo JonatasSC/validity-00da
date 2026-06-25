@@ -9,9 +9,9 @@ build/
 .venv/
 venv/
 env/
-logs/*.bin
-logs/*.log
+logs/*
 !logs/.gitkeep
+logs_teste/
 *.raw
 *.png
 .idea/

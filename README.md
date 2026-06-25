@@ -1,178 +1,191 @@
 # validity-00da
 
-Driver prototype for the Synaptics `06cb:00da` (FS7605) fingerprint sensor found in ThinkPad E14/E15 laptops.
+Linux fingerprint support and protocol reverse-engineering for the Synaptics
+**FS7605** sensor (`06cb:00da`, codename *Tudor*) found in **ThinkPad E14 / E15**
+laptops.
 
-Based on reverse engineering from the [Validity90](https://github.com/nmikhailov/Validity90) project which supports similar sensors (`138a:0090`, `138a:0097`, `06cb:009a`).
+This repository covers two parallel tracks:
+
+1. **Working fingerprint auth on Debian** — a reproducible recipe to get
+   `fprintd` + PAM (sudo, SDDM login) working *today*, using the Windows
+   driver inside a sandboxed Wine layer ([synaTudor]) plus the
+   [francescomcrtl/synaptics-00da-linux] patches, adapted for Debian.
+   See **[INSTALL-DEBIAN.md](INSTALL-DEBIAN.md)**.
+2. **Native Python reverse-engineering** — a from-scratch reimplementation of
+   the proprietary USB + custom-TLS protocol in pure Python, for people who
+   want a fully open driver with no closed-source DLL. The TLS handshake is
+   solved; device provisioning is still blocked.
+
+> **If you just want your fingerprint reader to work on Debian, go straight to
+> [INSTALL-DEBIAN.md](INSTALL-DEBIAN.md).** The native track is research.
+
+---
+
+## Why this repo exists
+
+The `06cb:00da` sensor is **not** supported by stock `libfprint`. The only
+working open driver is [synaTudor] (a Wine-based shim around the Windows DLLs),
+and the only packaged installer for it — [francescomcrtl/synaptics-00da-linux] —
+targets **Arch Linux only**. Getting it working on **Debian 13 (trixie)**
+requires several non-obvious changes (TOD libfprint build, PAM differences,
+DLL version mapping, extra build deps).
+
+This repo documents that Debian path end-to-end, and keeps a parallel pure-Python
+RE effort as a long-term route to a DLL-free driver.
+
+---
 
 ## Status
 
+### Track 1 — Wine-layer (working)
+
+| Component | Status |
+|-----------|--------|
+| synaTudor built + installed (`/usr/sbin/tudor/`) | ✅ |
+| `tudor_cli` enroll / verify | ✅ |
+| libfprint **TOD** built + installed on Debian | ✅ |
+| `fprintd-enroll` / `fprintd-verify` | ✅ |
+| PAM — `sudo` via fingerprint (password fallback intact) | ✅ |
+| PAM — **SDDM** login via fingerprint (KDE Plasma 6 / Wayland) | ✅ |
+
+Verified on Debian 13 (trixie), kernel 6.12, KDE Plasma 6 / Wayland.
+
+### Track 2 — Native Python RE
+
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 0 | Setup & environment | Done |
-| 1 | Probe / check state (`0x01`) | Done |
-| 2 | USB capture — provisioning protocol | Done (teste1.pcap) |
-| 3 | Protocolo pre-TLS documentado (`0x8e` subs) | Done |
-| 3.5 | Analise do certificado e chaves EC | Done |
-| 4 | TLS handshake (cipher `0xc02e` GCM) | Done |
-| 5 | Provisioning via TLS tunnel | Em progresso (tunnel funcional) |
-| 6 | Enrollment (fingerprint scan) | Pendente |
+| 0–3 | Setup, state probing, pre-TLS protocol (`0x8e` subcommands) | Done |
+| 3.5 | EC certificate / key analysis | Done |
+| 4 | Custom TLS 1.2 handshake (cipher `0xc02e`, AES-256-GCM) | **Done** |
+| 5 | Provisioning over the TLS tunnel | **Blocked** (see below) |
+| 6 | Enrollment | Not started (native) |
 
-## Setup
+**Native blocker:** the sensor ships in state `0x03`; the TLS tunnel works but
+`DB2`/frame commands return `ACCESS_DENIED` (`06 04`). The provisioning command
+that unlocks the sensor was not found in the driver DLLs — control appears to
+live in the sensor firmware. Without a fresh USB capture of a Windows first-time
+setup, the native provisioning step can't be identified. Track 1 sidesteps this
+entirely (the DLL does provisioning itself).
 
-### Dependencies
+---
+
+## Quick start (Debian working path)
+
+```bash
+# Full, copy-pasteable recipe with troubleshooting:
+#   -> INSTALL-DEBIAN.md
+lsusb | grep 06cb:00da    # confirm you actually have this sensor
+```
+
+Once installed:
+
+```bash
+fprintd-enroll            # enroll right index finger
+fprintd-verify            # test
+sudo -k && sudo true      # sudo should now prompt for the finger
+```
+
+---
+
+## Native track usage (research)
 
 ```bash
 pip install -r requirements.txt
+
+# udev rule so you don't need sudo (optional):
+#   SUBSYSTEM=="usb", ATTR{idVendor}=="06cb", ATTR{idProduct}=="00da", MODE="0666", GROUP="plugdev"
+
+python3 scripts/check_state.py      # read sensor state (0x03 = factory)
+python3 scripts/tls_handshake.py    # full PAIR + custom-TLS handshake
 ```
 
-### Linux (nativo ou WSL2)
+The custom TLS handshake has several **critical deviations** from standard TLS
+(documented inline and in the protocol notes):
 
-#### udev rules (avoid sudo)
+- `key_expansion` seed is `client_random + server_random` (not swapped)
+- transcript hash is always **SHA-256**, even though the cipher is SHA-384 (PRF uses SHA-384)
+- the wire certificate is `"PR"` + `echo[0:398]` (400 bytes)
+- ECDH uses an ephemeral CKE; the sensor's cert pubkey is the peer
+- `CertificateVerify` is prehashed SHA-256 with no algorithm indicator
+- the CKE is a raw `04 || X || Y` point (65 bytes, no length prefix)
 
-Create `/etc/udev/rules.d/99-validity-00da.rules`:
+> ⚠️ Do **not** run commands `0x06`, `0x0e`, `0x10` in automated scans — they
+> cause a USB disconnect. Always wrap sensor I/O in `USBError` handling.
 
-```
-SUBSYSTEM=="usb", ATTR{idVendor}=="06cb", ATTR{idProduct}=="00da", MODE="0666", GROUP="plugdev"
-```
+---
 
-Then reload:
-
-```bash
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-#### Verify device is detected
-
-```bash
-lsusb | grep 06cb:00da
-```
-
-### Windows
-
-1. Instalar Python 3.x de https://python.org (marcar "Add to PATH")
-2. `python -m venv venv && venv\Scripts\pip install -r requirements.txt`
-3. Instalar [Zadig](https://zadig.akeo.ie/) e trocar o driver do sensor para **libusbK**
-4. Copiar `libusb-1.0.dll` para `C:\Windows\System32\` (necessario para pyusb no Windows)
-
-> **Nota:** Com libusbK (Zadig) o pyusb funciona, mas Windows Hello fica bloqueado.
-> Para capturar trafego do driver Synaptics, reinstale o driver original e use USBPcap/Wireshark.
-
-### WSL2 + usbipd-win
-
-Para usar o sensor no WSL2:
-
-```powershell
-# PowerShell (admin)
-winget install usbipd
-usbipd list                          # encontrar o BUSID do sensor
-usbipd bind --busid <BUSID>
-usbipd attach --wsl --busid <BUSID>
-```
-
-```bash
-# WSL2
-lsusb | grep 06cb:00da
-sudo python3 scripts/check_state.py
-```
-
-## Usage
-
-### Verificar estado do sensor
-
-```bash
-python3 scripts/check_state.py
-```
-
-Envia `0x01` e mostra o estado atual:
-- `0x03` — nao provisionado (factory reset)
-- `0x07` — inicializado e pronto
-
-### Factory reset
-
-```bash
-python3 scripts/factory_reset.py
-```
-
-Reseta o sensor para estado `0x03`.
-
-### Provisioning (em desenvolvimento)
-
-```bash
-python3 scripts/provision.py
-```
-
-> **Nota:** O script atual usa blobs do Validity90 que NAO funcionam no 06cb:00da.
-> O provisioning real usa o comando `0x8e` + TLS handshake (ver PROTOCOL.md).
-
-### Init sequence (Validity90 — referencia)
-
-```bash
-python3 scripts/init_full.py
-```
-
-Roda sequencia MSG1-MSG6 do Validity90. Requer sensor em state `0x07`.
-
-### TLS handshake (em desenvolvimento)
-
-```bash
-python3 scripts/try_handshake.py
-```
-
-Tenta TLS handshake com o sensor usando chaves EC geradas. Executa a fase pre-TLS
-(0x01, 0x8e, 0x19) e depois o handshake completo com cipher `0xc02e` (AES-256-GCM).
-
-### Analise de captura
-
-```bash
-python3 scripts/parse_cert.py           # Extrai cert do pcap
-python3 scripts/verify_cert_sig.py      # Verifica assinatura
-python3 scripts/extract_client_hello.py # Formato do ClientHello
-```
-
-Scripts de analise do `teste1.pcap`. Requerem o arquivo `Wireshark/teste1.pcap`.
-
-## Architecture
+## Repository layout
 
 ```
-validity00da/
-├── constants.py     # Static bytes, keys, init sequences
-├── usb_device.py    # pyusb wrapper (open/read/write/interrupt) — Windows + Linux
-├── protocol.py      # Init sequence MSG1-MSG6, RSP6 parsing (Validity90)
-├── crypto.py        # TLS-PRF, AES-256-CBC, ECDH, ECDSA, key derivation (V90)
-├── tls_session.py   # Custom TLS 1.2 handshake (V90, cipher 0xc005 — precisa atualizacao)
-└── sensor.py        # High-level commands (LED, scan, verify)
-
-scripts/
-├── check_state.py          # Verifica estado do sensor (0x03/0x07)
-├── factory_reset.py        # Reset para estado 0x03
-├── try_handshake.py        # Tentativa de TLS handshake com chaves proprias
-├── parse_cert.py           # Extrai certificado e handshake do teste1.pcap
-├── verify_cert_sig.py      # Verifica assinatura CertificateVerify
-├── extract_client_hello.py # Extrai formato do ClientHello do pcap
-├── provision.py            # Tentativa de provisioning (blobs V90 — nao funciona)
-├── init_full.py            # Init MSG1-MSG6 (V90 reference)
-└── handshake.py            # TLS handshake test (V90 — precisa atualizacao)
-
-logs/
-└── wireshark_teste1_analysis.txt  # Analise completa do teste1.pcap
+validity00da/        Python module — USB device wrapper (pyusb), Linux + Windows
+scripts/             Native-track scripts:
+                       tls_handshake.py   full PAIR + custom-TLS handshake (the core)
+                       tls_provision.py   TLS tunnel + post-TLS commands
+                       check_state.py     read sensor state
+                       factory_reset.py   reset sensor to state 0x03
+                       frida_hook_tls.js  Windows-side capture hook (+ guide)
+INSTALL-DEBIAN.md    The Debian install recipe (Track 1)
+requirements.txt     Python deps for the native track
 ```
 
-## Protocol Overview
+> **Local-only (gitignored), not in the public tree:** `docs/` (RE notes — a
+> personal Obsidian vault, including raw decompiler output of a proprietary DLL),
+> `bin/` and `Ghidra/` (Windows driver binaries + Ghidra project), `Wireshark/`
+> (USB captures). These are kept out of the repo on purpose. The protocol summary
+> above and [INSTALL-DEBIAN.md](INSTALL-DEBIAN.md) are self-contained without them.
+> The full exploratory RE script history is preserved in the git log.
 
-O sensor usa protocolo customizado sobre USB bulk transfers:
+---
 
-1. **Pre-TLS**: Leitura de info com `0x01`, `0x19`, e `0x8e` (subcomandos 0x09, 0x1a, 0x2e, 0x2f)
-2. **TLS handshake**: TLS 1.2 com `TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384` (0xc02e), records do host prefixados com `44 00 00 00`
-3. **Provisioning**: Comandos de provisioning enviados dentro do tunel TLS (criptografado)
-4. **Enrollment**: Captura de fingerprints tambem via TLS
+## How it works (Track 1, high level)
 
-> **Importante:** O protocolo e diferente do Validity90 (`138a:0090`). Os comandos de provisioning
-> (0x06, 0x07, 0x08, 0x75, 0x4f, 0x50, 0x1a) do Validity90 NAO existem neste firmware.
+```
+fprintd
+  └─ libfprint-TOD (1.95.1+tod1)
+       └─ libtudor_tod.so            (TOD plugin)
+            └─ tudor-host (D-Bus)    (sandboxed: netns, seccomp, read-only fs)
+                 └─ Wine
+                      └─ Synaptics Windows DLLs (v104, Lenovo)
+                           └─ sensor (USB)
+```
 
-See [PROTOCOL.md](PROTOCOL.md) for the full protocol specification.
+The closed-source DLLs run inside `tudor-host`, which is sandboxed with a network
+namespace (no network), a tight seccomp whitelist, dropped capabilities, and a
+read-only root via `pivot_root`. Acceptable for personal use; see the security
+notes in [INSTALL-DEBIAN.md](INSTALL-DEBIAN.md#security-notes).
 
-## References
+---
 
-- [Validity90](https://github.com/nmikhailov/Validity90) - C prototype for `138a:0090` family
-- [python-validity](https://github.com/nicegreengorilla/python-validity) - Python driver for `06cb:009a`
+## Contributing and forking
+
+This repo is meant to be forked and reused. The most valuable contributions:
+
+- **Debian / Ubuntu install fixes** — if the recipe drifts with newer package
+  versions, PRs to [INSTALL-DEBIAN.md](INSTALL-DEBIAN.md) are welcome.
+- **A fresh USB capture** of a Windows first-time setup (Frida script in
+  `scripts/frida_hook_tls.js`) — this is the single thing that would unblock the
+  native provisioning step.
+- **Upstreaming Debian support** to [francescomcrtl/synaptics-00da-linux] — the
+  Debian-specific deltas documented here (PAM, TOD build, DLL mapping) are the
+  basis for that.
+
+If you fork: the native scripts hit real hardware. Keep the danger-command skip
+list (`0x06`, `0x0e`, `0x10`) and always handle `USBError`.
+
+---
+
+## Credits
+
+- [synaTudor] (Popax21) — the Wine-layer driver this builds on
+- [francescomcrtl/synaptics-00da-linux] — the Arch installer / patches
+- [Validity90] (nmikhailov) — C prototype for the `138a:0090` family
+- [python-validity] (uunicorn) — Python driver for `06cb:009a`
+
+## License
+
+GPL-2.0 — inherited from [synaTudor]. See [LICENSE](LICENSE).
+
+[synaTudor]: https://github.com/Popax21/synaTudor
+[francescomcrtl/synaptics-00da-linux]: https://github.com/francescomcrtl/synaptics-00da-linux
+[Validity90]: https://github.com/nmikhailov/Validity90
+[python-validity]: https://github.com/uunicorn/python-validity
